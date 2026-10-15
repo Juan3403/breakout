@@ -190,7 +190,7 @@ let mode = 'classic', level = 1, score = 0, lives = 3, timeLeft = 0, fromEditor 
 let paddles = [], balls = [], bricks = [], boss = null, powerups = [], bullets = [], eBullets = [], particles = [];
 let topY = 70, combo = 0, comboPop = 0, shake = 0, bannerT = 0, banner = { text: '', sub: '' }, clearT = 0;
 let timers = { W: 0, N: 0, S: 0, Q: 0, G: 0, F: 0, A: 0, H: 0 }, shield = false, hurtCD = 0, fireCD = [0, 0];
-let lostLife = false, puCount = 0, laserKills = 0, fc = 0, dailySeed = 0;
+let lastPadFc = 0, lostLife = false, puCount = 0, laserKills = 0, fc = 0, dailySeed = 0;
 let keys = {}, mouseX = W / 2, mouseY = 0, mouseActive = false, mouseDown = false;
 let auto = false, autoUsed = false, autoWait = 0;
 let gameSpeed = 1;
@@ -247,7 +247,7 @@ function loadLevel() {
   banner = boss ? { text: 'CHEFE!', sub: 'Nível ' + level } : { text: 'Nível ' + level, sub: MODES[mode].n };
   bannerT = 150;
 }
-function serve() { balls = [newBall()]; state = 'ready'; }
+function serve() { balls = [newBall()]; state = 'ready'; lastPadFc = fc; }
 function startGame(m) {
   if (m === 'custom' && !customRows) { toast('Crie uma fase no editor primeiro.'); return; }
   mode = m; level = 1; score = 0; laserKills = 0; overWon = false; autoUsed = auto; autoWait = 0;
@@ -372,7 +372,7 @@ function paddleWidth() { return padBase() * (timers.W > 0 ? 1.6 : 1) * (timers.N
 
 function brickX(br) { return br.t === 'M' ? br.x0 + br.dir * Math.sin(fc * 0.03) * 20 : br.x0; }
 
-const MIN_VY = 0.3, PAD_ANGLE = 60 * Math.PI / 180;
+const MIN_VY = 0.3, MIN_VX = 0.1, PAD_ANGLE = 60 * Math.PI / 180;
 function updateBalls() {
   const sp = ballSpeed();
   const p1 = paddles[0], p2 = paddles[1];
@@ -386,6 +386,11 @@ function updateBalls() {
       b.vy = (b.vy > 0 ? 1 : -1) * sp * MIN_VY;
       b.vx = (b.vx < 0 ? -1 : 1) * sp * Math.sqrt(1 - MIN_VY * MIN_VY);
     }
+    // nem totalmente vertical (evita a bola presa subindo e descendo sempre na mesma coluna)
+    if (Math.abs(b.vx) < sp * MIN_VX) {
+      b.vx = (b.vx < 0 ? -1 : 1) * sp * MIN_VX;
+      b.vy = (b.vy > 0 ? 1 : -1) * sp * Math.sqrt(1 - MIN_VX * MIN_VX);
+    }
     const steps = Math.ceil(sp / 3);
     for (let s = 0; s < steps && !b.stuck; s++) {
       b.x += b.vx / steps; b.y += b.vy / steps;
@@ -395,14 +400,14 @@ function updateBalls() {
       if (shield && b.vy > 0 && b.y + b.r >= H - 10) { b.vy = -Math.abs(b.vy); b.y = H - 10 - b.r; shield = false; SFX.pu(); shake = 4; }
       // raquete inferior
       if (b.vy > 0 && b.y + b.r >= p1.y && b.y + b.r <= p1.y + p1.h + 8 && b.x >= p1.x - b.r && b.x <= p1.x + p1.w + b.r) {
-        combo = 0; padHits++; SFX.paddle(); b.y = p1.y - b.r;
+        combo = 0; padHits++; lastPadFc = fc; SFX.paddle(); b.y = p1.y - b.r;
         if (timers.A > 0) { b.stuck = true; b.trail.length = 0; b.off = clamp(b.x - (p1.x + p1.w / 2), -p1.w / 2, p1.w / 2); b.vx = b.vy = 0; break; }
         const a = clamp((b.x - (p1.x + p1.w / 2)) / (p1.w / 2), -1, 1) * PAD_ANGLE;
         b.vx = Math.sin(a) * sp; b.vy = -Math.cos(a) * sp;
       }
       // raquete superior (2 jogadores)
       if (p2 && b.vy < 0 && b.y - b.r <= p2.y + p2.h && b.y - b.r >= p2.y - 8 && b.x >= p2.x - b.r && b.x <= p2.x + p2.w + b.r) {
-        SFX.paddle(); b.y = p2.y + p2.h + b.r;
+        lastPadFc = fc; SFX.paddle(); b.y = p2.y + p2.h + b.r;
         const a = clamp((b.x - (p2.x + p2.w / 2)) / (p2.w / 2), -1, 1) * PAD_ANGLE;
         b.vx = Math.sin(a) * sp; b.vy = Math.cos(a) * sp;
       }
@@ -462,36 +467,113 @@ function predictX(b, y) {
   x = ((x % (2 * span)) + 2 * span) % (2 * span); if (x > span) x = 2 * span - x;
   return x + lo;
 }
-// desvia dos tiros do chefe e dos power-ups ruins sem largar a bola: escolhe a posição segura mais próxima
-// do alvo em que a raquete ainda cobre o ponto de queda da bola
+// simula a bola (paredes, tijolos e chefe) até ela voltar à altura y descendo: {t: quadros, x}, ou null
+function simLanding(b, y) {
+  let x = b.x, yy = b.y, vx = b.vx, vy = b.vy;
+  const r = b.r, K = 3, fire = b.fire || timers.F > 0;
+  const list = bricks.filter(o => o.hp > 0).map(o => ({ x: o.x, y: o.y, w: BW, h: BH, hp: o.t === 'X' ? 1e9 : o.hp }));
+  const bo = boss ? { x: boss.x, y: boss.y, w: boss.w, h: boss.h, hp: 1e9 } : null;
+  if (bo) list.push(bo);
+  let bvx = boss ? boss.vx : 0;
+  for (let f = 1; f <= 420; f++) {
+    if (bo) { bo.x += bvx; if (bo.x < 20 || bo.x + bo.w > W - 20) { bvx *= -1; bo.x = clamp(bo.x, 20, W - 20 - bo.w); } }
+    for (let k = 0; k < K; k++) {
+      x += vx / K; yy += vy / K;
+      if (x < r) { x = r; vx = Math.abs(vx); } else if (x > W - r) { x = W - r; vx = -Math.abs(vx); }
+      if (yy < r) { yy = r; vy = Math.abs(vy); }
+      if (vy > 0 && yy >= y) return { t: f, x };
+      for (const o of list) {
+        if (o.hp <= 0) continue;
+        const ox = o.w / 2 + r - Math.abs(x - o.x - o.w / 2), oy = o.h / 2 + r - Math.abs(yy - o.y - o.h / 2);
+        if (ox <= 0 || oy <= 0) continue;
+        if (fire && o.hp < 1e8) { o.hp = 0; continue; }
+        if (ox < oy) { const s = x < o.x + o.w / 2 ? -1 : 1; vx = s * Math.abs(vx); x += s * ox; }
+        else { const s = yy < o.y + o.h / 2 ? -1 : 1; vy = s * Math.abs(vy); yy += s * oy; }
+        o.hp--; break;
+      }
+    }
+  }
+  return null;
+}
+// a bola que volta primeiro à raquete (inclusive a que ainda está subindo): {b, tt, bx}; calculado uma vez por quadro
+let nbCache = { f: -1, r: null };
+function nextBall(py) {
+  if (nbCache.f === fc) return nbCache.r;
+  const res = { b: null, tt: 1e9, bx: 0 };
+  for (const b of balls) {
+    if (b.stuck) continue;
+    let L = simLanding(b, py);
+    if (!L && b.vy > 0) L = { t: (py - b.y) / b.vy, x: predictX(b, py) };
+    if (L && L.t < res.tt) { res.b = b; res.tt = L.t; res.bx = L.x; }
+  }
+  nbCache = { f: fc, r: res };
+  return res;
+}
+// Planejador de desvio. Simula os próximos 4 s: a raquete (10 px/quadro), os tiros que já estão na tela, os leques
+// FUTUROS do chefe (que miram onde a raquete estiver no disparo, então dependem do plano) e a queda da bola.
+// Busca por amostragem: o plano anterior, mutações dele e planos aleatórios; usa o primeiro destino do melhor.
+const PL_SLOT = 30, PL_N = 8, PL_H = PL_SLOT * PL_N, PL_TRIES = 200;
+let plan = null, planT0 = 0;
 function autoTarget() {
-  const t = autoAim(), p = paddles[0], py = p.y - 7, hw = p.w / 2;
+  const t = autoAim(), p = paddles[0], py = p.y - 7, hw = p.w / 2, c = p.x + hw;
   const th = eBullets.concat(powerups.filter(q => !PU[q.t].good).map(q => ({ x: q.x, y: q.y, vx: 0, vy: q.vy })))
     .filter(e => e.vy > 0 && e.y < p.y + p.h && e.y > p.y - 260)
-    .map(e => { const ta = Math.max(0, p.y - e.y) / e.vy; return { ex: e.x + e.vx * ta, ta }; });
-  // folga entre a raquete em x e cada tiro no instante em que ele chega
-  const clr = x => th.reduce((m, q) => Math.min(m, Math.abs(q.ex - x) - hw), 1e9);
-  const MARGIN = 12;
-  if (!th.length || clr(t) > MARGIN) return t;
-  let tb = null, tt = 1e9;
-  for (const b of balls) { if (b.stuck || b.vy <= 0) continue; const s = (py - b.y) / b.vy; if (s < tt) { tt = s; tb = b; } }
-  const bx = tb ? predictX(tb, py) : null;
-  // varre a largura toda; prefere uma posição segura perto do alvo que ainda cubra a bola, senão a de maior folga
-  const pick = { safe: null, okMax: null, anySafe: null, anyMax: null };
-  const upd = (k, x, v) => { if (!pick[k] || v < pick[k].v) pick[k] = { x, v }; };
-  for (let x = hw; x <= W - hw; x += 5) {
-    const k = clr(x), d = Math.abs(x - t), ok = bx === null || tt > 45 || Math.abs(bx - x) <= hw - 6;
-    if (k > MARGIN) { upd('anySafe', x, d); if (ok) upd('safe', x, d); }
-    upd('anyMax', x, -k); if (ok) upd('okMax', x, -k);
+    .map(e => ({ x: e.x, vx: e.vx, ta: Math.max(0, p.y - e.y) / e.vy, end: (p.y + p.h - e.y) / e.vy }));
+  if (!boss && !th.length) { plan = null; return t; }
+  const nb = nextBall(py), tt = nb.tt, bx = nb.b ? nb.bx : null;
+  // plano anterior, deslocado conforme o tempo passou
+  if (!plan || fc < planT0 || fc - planT0 > 90) { plan = new Array(PL_N).fill(c); planT0 = fc; }
+  while (fc >= planT0 + PL_SLOT) { plan.shift(); plan.push(plan[PL_N - 2]); planT0 += PL_SLOT; }
+  const pos = new Float32Array(PL_H + 1);
+  const cad = boss ? Math.max(45, 110 - level * 3) : 0, spread = level >= 10 ? [-0.25, 0, 0.25] : [0];
+  const evalPlan = pl => {
+    pos[0] = c; let slot = 0, rem = planT0 + PL_SLOT - fc;
+    for (let n = 0; n < PL_H; n++) {
+      while (rem <= 0 && slot < PL_N - 1) { slot++; rem += PL_SLOT; }
+      const d = pl[slot] - pos[n]; pos[n + 1] = pos[n] + (d > 10 ? 10 : d < -10 ? -10 : d); rem--;
+    }
+    let k = 0;
+    for (const q of th) {
+      for (let n = Math.max(0, Math.floor(q.ta) - 1), e = Math.min(PL_H, Math.ceil(q.end) + 1); n <= e; n++) {
+        if (Math.abs(q.x + q.vx * n - pos[n]) <= hw + 6) { k += 1000; break; }
+      }
+    }
+    if (boss) {
+      const by = boss.y + boss.h, lo = 20 + boss.w / 2, hi = W - 20 - boss.w / 2;
+      for (let n0 = Math.max(1, boss.shoot); n0 < PL_H; n0 += cad) {
+        let bc = boss.x + boss.w / 2 + boss.vx * n0; // quicando nas paredes
+        const span = hi - lo; let u = ((bc - lo) % (2 * span) + 2 * span) % (2 * span); bc = lo + (u > span ? 2 * span - u : u);
+        for (const sp of spread) {
+          const a = Math.atan2(p.y - by, pos[n0] - bc) + sp, vy = Math.sin(a) * 3.6, vx = Math.cos(a) * 3.6;
+          if (vy <= 0) continue;
+          for (let m = Math.floor(n0 + (p.y - by) / vy), e = Math.min(PL_H, Math.ceil(n0 + (p.y + p.h - by) / vy)); m <= e; m++) {
+            if (Math.abs(bc + vx * (m - n0) - pos[m]) <= hw + 6) { k += 1000; break; }
+          }
+        }
+      }
+    }
+    if (bx !== null && !shield && tt < PL_H && Math.abs(bx - pos[Math.floor(tt)]) > hw - 6) k += 900;
+    for (let n = 5; n <= 30; n += 5) k += 0.02 * Math.abs(pos[n] - t);
+    return k;
+  };
+  let best = plan, bc = evalPlan(plan);
+  const rndX = () => hw + Math.random() * (W - 2 * hw);
+  const tryPlan = pl => { const k = evalPlan(pl); if (k < bc) { bc = k; best = pl; } };
+  tryPlan(new Array(PL_N).fill(t));
+  for (let i = 0; i < PL_TRIES && bc >= 1; i++) {
+    const pl = i < PL_TRIES * 0.6 ? plan.slice() : new Array(PL_N).fill(0).map(() => rndX());
+    if (i < PL_TRIES * 0.6) for (let m = 1 + (i & 1); m > 0; m--) {
+      const j = Math.floor(Math.random() * Math.random() * PL_N);
+      pl[j] = Math.random() < 0.5 ? rndX() : clamp(pl[j] + (Math.random() - 0.5) * 160, hw, W - hw);
+    }
+    tryPlan(pl);
   }
-  if (pick.safe) return pick.safe.x;
-  if (pick.okMax && -pick.okMax.v > 0) return pick.okMax.x;
-  return (pick.anySafe || pick.anyMax).x;
+  plan = best;
+  return best[0];
 }
 function autoAim() {
   const p = paddles[0], py = p.y - 7, c = p.x + p.w / 2;
-  let tb = null, tt = 1e9;
-  for (const b of balls) { if (b.stuck || b.vy <= 0) continue; const t = (py - b.y) / b.vy; if (t < tt) { tt = t; tb = b; } }
+  const nb = nextBall(py), tb = nb.b, tt = nb.tt;
   const goods = powerups.filter(q => PU[q.t].good && q.y < py).sort((a, b) => b.y - a.y);
   const lz = laserTarget(p, c);
   if (!tb) {
@@ -499,12 +581,17 @@ function autoAim() {
     if (lz !== null) return lz;
     const st = balls.find(b => b.stuck); return st ? st.x : c;
   }
-  const bx = predictX(tb, py);
+  const bx = nb.bx;
   // pega o power-up bom se der tempo de chegar nele e ainda estar na bola quando ela descer
   for (const q of goods) {
     const tp = (py - q.y) / q.vy;
     if (tp > tt) continue;
     if (Math.abs(q.x - c) <= 10 * tp + p.w / 2 && Math.abs(q.x - bx) <= 10 * (tt - tp) + p.w * 0.45) return q.x;
+  }
+  // contra o chefe, laser e multibola valem mais que a bola: se dá para alcançá-los, vai mesmo sem tempo de voltar à bola
+  if (boss) for (const q of goods) {
+    if (!(q.t === 'G' ? timers.G <= 0 : q.t === 'M')) continue;
+    if (Math.abs(q.x - c) <= 10 * ((py - q.y) / q.vy) + p.w / 2 - 8) return q.x;
   }
   // com laser: se sobrar tempo, posiciona o cano da raquete sob um tijolo/o chefe e volta a tempo da bola
   if (lz !== null && Math.abs(bx - lz) / 10 <= tt - 10) return lz;
@@ -515,8 +602,8 @@ function autoAim() {
     autoPick = arr.length ? arr[Math.floor(Math.random() * arr.length)] : null;
     autoJit = rnd(-0.6, 0.6); autoPickAt = padHits;
   }
-  let tx = W / 2, ty = 150, jit = 0;
-  if (boss) { tx = boss.x + boss.w / 2; ty = boss.y + boss.h; }
+  let tx = W / 2, ty = 150, jit = stalled ? autoJit : 0;
+  if (boss) { const m = bossAim(bx, py, tb); tx = m.tx; ty = m.ty; }
   else {
     // ponto de mira com caminho livre (por baixo ou pelos lados do tijolo); no ciclo, tenta um tijolo sorteado
     const aim = (stalled && autoPick && pickAim(bx, py, autoPick)) || pickAim(bx, py);
@@ -525,11 +612,26 @@ function autoAim() {
       let bt = null;
       for (const b of bricks) if (brickNeeded(b) && (!bt || b.y > bt.y || (b.y === bt.y && Math.abs(b.x - bx) < Math.abs(bt.x - bx)))) bt = b;
       if (bt) { tx = bt.x + BW / 2; ty = bt.y + BH; }
-      if (stalled) jit = autoJit;
     }
   }
   const r = clamp(Math.atan2(tx - bx, py - ty) / PAD_ANGLE + jit, -0.85, 0.85);
   return clamp(bx - r * p.w / 2, p.w / 2, W - p.w / 2);
+}
+// mira no chefe pela faixa com menos tijolos no caminho (com antecipação do movimento dele);
+// se todas estão bloqueadas, mira no tijolo mais baixo que tapa a melhor faixa
+function bossAim(bx, py, tb) {
+  const R = 7, alive = bricks.filter(b => b.hp > 0), ty = boss.y + boss.h + R;
+  const travel = (py - ty) / Math.max(Math.abs(tb.vy), 1);
+  let best = null;
+  for (const f of [0.5, 0.3, 0.7, 0.15, 0.85]) {
+    const tx = clamp(boss.x + boss.w * f + boss.vx * travel, 30, W - 30);
+    const block = alive.filter(o => segRect(bx, py, tx, ty, o.x - R, o.y - R, o.x + BW + R, o.y + BH + R));
+    const sc = block.reduce((n, o) => n + (o.t === 'X' ? 100 : 1), 0) * 100 + Math.abs(f - 0.5) * 50;
+    if (!best || sc < best.sc) best = { tx, ty, block, sc };
+  }
+  const low = best.block.filter(o => o.t !== 'X').sort((a, b) => b.y - a.y)[0];
+  if (!low) return best;
+  return pickAim(bx, py, low) || { tx: low.x + BW / 2, ty: low.y + BH + R };
 }
 // o segmento (x0,y0)-(x1,y1) cruza o retângulo?
 function segRect(x0, y0, x1, y1, rx0, ry0, rx1, ry1) {
@@ -543,14 +645,32 @@ function segRect(x0, y0, x1, y1, rx0, ry0, rx1, ry1) {
 // escolhe o tijolo mais baixo que dá para acertar em linha reta a partir de (bx, py), por baixo ou pelos lados
 function pickAim(bx, py, only) {
   const R = 7, alive = bricks.filter(b => b.hp > 0);
+  const free = (b, x0, y0, x1, y1) => !alive.some(o => o !== b && segRect(x0, y0, x1, y1, o.x - R, o.y - R, o.x + BW + R, o.y + BH + R));
+  const pts = b => [[b.x + BW / 2, b.y + BH + R], [b.x - R, b.y + BH / 2], [b.x + BW + R, b.y + BH / 2]];
   let best = null, bs = -1e9;
   for (const b of only ? [only] : bricks) {
     if (!brickNeeded(b)) continue;
-    for (const [tx, ty] of [[b.x + BW / 2, b.y + BH + R], [b.x - R, b.y + BH / 2], [b.x + BW + R, b.y + BH / 2]]) {
+    for (const [tx, ty] of pts(b)) {
       if (ty >= py || tx < R || tx > W - R) continue;
-      if (alive.some(o => o !== b && segRect(bx, py, tx, ty, o.x - R, o.y - R, o.x + BW + R, o.y + BH + R))) continue;
+      if (!free(b, bx, py, tx, ty)) continue;
       const sc = b.y * 1000 - Math.abs(tx - bx);
       if (sc > bs) { bs = sc; best = { tx, ty }; }
+    }
+  }
+  if (best) return best;
+  // sem linha reta: tenta com um ricochete numa parede lateral (mira no alvo "espelhado")
+  for (const b of only ? [only] : bricks) {
+    if (!brickNeeded(b)) continue;
+    for (const [tx, ty] of pts(b)) {
+      if (ty >= py || tx < R || tx > W - R) continue;
+      for (const wx of [R, W - R]) {
+        const mx = 2 * wx - tx, s = (wx - bx) / (mx - bx);
+        if (!(s > 0 && s < 1)) continue;
+        const wy = py + s * (ty - py);
+        if (!free(b, bx, py, wx, wy) || !free(b, wx, wy, tx, ty)) continue;
+        const sc = b.y * 1000 - Math.abs(mx - bx);
+        if (sc > bs) { bs = sc; best = { tx: mx, ty }; }
+      }
     }
   }
   return best;
@@ -618,6 +738,8 @@ function updateGame() {
   if (mode === 'time' && --timeLeft <= 0) { timeLeft = 0; gameOver(false); return; }
   updateBalls();
   if (state !== 'playing') return;
+  // bola presa numa câmara fechada por tijolos de aço: 25 s sem tocar a raquete nem quebrar nada, novo saque sem perder vida
+  if (fc - lastPadFc > 1500 && fc - lastProgress > 1500 && !balls.some(b => b.stuck)) { toast('Bola presa! Novo saque, sem perder vida'); serve(); return; }
 
   // lasers
   if (timers.G > 0 && !balls.some(b => b.stuck)) { if (fireHeld(0)) shoot(0); if (paddles[1] && fireHeld(1)) shoot(1); }
